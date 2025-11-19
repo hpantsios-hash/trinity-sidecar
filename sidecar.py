@@ -1,34 +1,62 @@
-import os, json, time, asyncio, websockets
+import os
+import json
+import time
+import asyncio
+import websockets
 from collections import defaultdict
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
+
+from synthetic_engine import SyntheticEngine, TimeframeConfig  # NEW
+
 
 # --- Config ---
 API_KEY = os.getenv("FINNHUB_API_KEY")
 if not API_KEY:
     raise RuntimeError("FINNHUB_API_KEY is not set")
+
 WS_URL = f"wss://ws.finnhub.io?token={API_KEY}"
 
 # Dynamic subscription set
-SUBS = set()  # symbols we want to track, e.g. "BINANCE:BTCUSDT"
+SUBS = set()  # symbols we want to track, e.g. "BINANCE:BTCUSDT", "AAPL", "QQQ"
 
-# Shared state
-tick = {}                     # latest price per symbol
-livebars = defaultdict(dict)  # symbol -> {"1m": bar}
+# Latest tick per symbol
+tick = {}
+
+# --- Synthetic Candle Engine setup ---
+
+TF_CONFIGS = [
+    # Duration-based microstructure
+    TimeframeConfig("1s", "duration", size_seconds=1),
+    TimeframeConfig("2s", "duration", size_seconds=2),
+    TimeframeConfig("5s", "duration", size_seconds=5),
+    TimeframeConfig("10s", "duration", size_seconds=10),
+    TimeframeConfig("12s", "duration", size_seconds=12),
+    TimeframeConfig("30s", "duration", size_seconds=30),
+
+    # Standard intraday
+    TimeframeConfig("1m", "duration", size_seconds=60),
+    TimeframeConfig("5m", "duration", size_seconds=300),
+    TimeframeConfig("15m", "duration", size_seconds=900),
+    TimeframeConfig("1h", "duration", size_seconds=3600),
+
+    # Calendar-based higher TFs
+    TimeframeConfig("day", "calendar", calendar_type="day"),
+    TimeframeConfig("week", "calendar", calendar_type="week"),
+    TimeframeConfig("month", "calendar", calendar_type="month"),
+    TimeframeConfig("quarter", "calendar", calendar_type="quarter"),
+    TimeframeConfig("year", "calendar", calendar_type="year"),
+
+    # Multi-year macro
+    TimeframeConfig("2y", "calendar", calendar_type="multi-year", years_span=2),
+    TimeframeConfig("5y", "calendar", calendar_type="multi-year", years_span=5),
+    TimeframeConfig("10y", "calendar", calendar_type="multi-year", years_span=10),
+]
+
+engine = SyntheticEngine(TF_CONFIGS)
 
 # Queue for subscribe commands from HTTP handlers to WS loop
 pending_subs: asyncio.Queue = asyncio.Queue()
-
-
-def new_bar(ts: int):
-    start = ts - (ts % 60)
-    return {
-        "t": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start)),
-        "o": None, "h": None, "l": None, "c": None, "v": 0.0,
-        "elapsed": 0,
-        "remaining": 60,
-        "complete": False
-    }
 
 
 async def ws_loop():
@@ -64,27 +92,8 @@ async def ws_loop():
                         # Update last tick
                         tick[sym] = {"symbol": sym, "price": px, "ts": ts}
 
-                        # Update 1m live bar
-                        bar = livebars[sym].get("1m") or new_bar(ts)
-                        if bar["o"] is None:
-                            bar["o"] = px
-                            bar["h"] = px
-                            bar["l"] = px
-                            bar["c"] = px
-                        else:
-                            bar["h"] = max(bar["h"], px)
-                            bar["l"] = min(bar["l"], px)
-                            bar["c"] = px
-
-                        bar["v"] += vol
-                        now = time.time()
-                        # Approximate elapsed time within bar
-                        bar["elapsed"] = int(now - ts + (ts % 60))
-                        bar["remaining"] = 60 - bar["elapsed"]
-                        if bar["remaining"] <= 0:
-                            bar["complete"] = True
-
-                        livebars[sym]["1m"] = bar
+                        # Feed synthetic engine for ALL timeframes
+                        engine.ingest_tick(sym, px, vol, ts)
 
         except Exception as e:
             print("WS reconnect:", e)
@@ -121,10 +130,50 @@ async def live_price(symbol: str):
 
 @app.get("/live/candle")
 async def live_candle(symbol: str, tf: str = "1m"):
-    # Dynamically subscribe if needed
+    """
+    Backwards-compatible live candle endpoint.
+    Uses SyntheticEngine under the hood (default tf=1m).
+    """
     await ensure_subscribed(symbol)
 
-    bar = livebars.get(symbol, {}).get(tf)
+    bar = engine.get_candle(symbol, tf)
     if not bar:
         raise HTTPException(status_code=404, detail="no candle yet for symbol")
     return JSONResponse(bar)
+
+
+@app.get("/synthetic/candle")
+async def synthetic_candle(symbol: str, tf: str):
+    """
+    Generic synthetic candle endpoint for arbitrary timeframe.
+    Example: tf=1s,2s,5s,10s,12s,30s,1m,5m,15m,1h,day,week,month,quarter,year,2y,5y,10y
+    """
+    await ensure_subscribed(symbol)
+
+    bar = engine.get_candle(symbol, tf)
+    if not bar:
+        raise HTTPException(status_code=404, detail="no candle yet for symbol/tf")
+    return JSONResponse(bar)
+
+
+@app.get("/synthetic/grid")
+async def synthetic_grid(
+    symbol: str,
+    tfs: str = "1s,5s,1m,5m,15m,1h,day,week,month,quarter,year,5y",
+):
+    """
+    Multi-timeframe grid endpoint.
+    Returns a dict: { tf_name: candle_json } for requested tfs.
+    """
+    await ensure_subscribed(symbol)
+
+    tf_list = [x.strip() for x in tfs.split(",") if x.strip()]
+    result = {}
+    for tf in tf_list:
+        bar = engine.get_candle(symbol, tf)
+        if bar:
+            result[tf] = bar
+
+    if not result:
+        raise HTTPException(status_code=404, detail="no candles yet for symbol/tfs")
+    return JSONResponse(result)
